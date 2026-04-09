@@ -30,6 +30,11 @@ export interface RecoveryLogger {
   error(msg: string): void;
 }
 
+export interface PendingDeliveryDrainDecision {
+  match: boolean;
+  bypassBackoff?: boolean;
+}
+
 const MAX_RETRIES = 5;
 
 /** Backoff delays in milliseconds indexed by retry count (1-based). */
@@ -179,6 +184,145 @@ export function isPermanentDeliveryError(error: string): boolean {
   return PERMANENT_ERROR_PATTERNS.some((re) => re.test(error));
 }
 
+async function drainQueuedEntry(opts: {
+  entry: QueuedDelivery;
+  cfg: OpenClawConfig;
+  deliver: DeliverFn;
+  stateDir?: string;
+  onRecovered?: (entry: QueuedDelivery) => void;
+  onFailed?: (entry: QueuedDelivery, errMsg: string) => void;
+}): Promise<"recovered" | "failed" | "moved-to-failed" | "already-gone"> {
+  const { entry } = opts;
+  try {
+    await opts.deliver(buildRecoveryDeliverParams(entry, opts.cfg));
+    await ackDelivery(entry.id, opts.stateDir);
+    opts.onRecovered?.(entry);
+    return "recovered";
+  } catch (err) {
+    const errMsg = formatErrorMessage(err);
+    opts.onFailed?.(entry, errMsg);
+    if (isPermanentDeliveryError(errMsg)) {
+      try {
+        await moveToFailed(entry.id, opts.stateDir);
+        return "moved-to-failed";
+      } catch (moveErr) {
+        if (getErrnoCode(moveErr) === "ENOENT") {
+          return "already-gone";
+        }
+      }
+    } else {
+      try {
+        await failDelivery(entry.id, errMsg, opts.stateDir);
+        return "failed";
+      } catch (failErr) {
+        if (getErrnoCode(failErr) === "ENOENT") {
+          return "already-gone";
+        }
+      }
+    }
+    return "failed";
+  }
+}
+
+export async function drainPendingDeliveries(opts: {
+  drainKey: string;
+  logLabel: string;
+  cfg: OpenClawConfig;
+  log: RecoveryLogger;
+  stateDir?: string;
+  deliver?: DeliverFn;
+  selectEntry: (entry: QueuedDelivery, now: number) => PendingDeliveryDrainDecision;
+}): Promise<void> {
+  if (drainInProgress.get(opts.drainKey)) {
+    opts.log.info(`${opts.logLabel}: already in progress for ${opts.drainKey}, skipping`);
+    return;
+  }
+
+  drainInProgress.set(opts.drainKey, true);
+  try {
+    const now = Date.now();
+    const deliver = opts.deliver ?? (await loadDeliverRuntime()).deliverOutboundPayloads;
+    const matchingEntries = (await loadPendingDeliveries(opts.stateDir))
+      .map((entry) => ({
+        entry,
+        decision: opts.selectEntry(entry, now),
+      }))
+      .filter(
+        (item): item is { entry: QueuedDelivery; decision: PendingDeliveryDrainDecision } =>
+          item.decision.match,
+      )
+      .toSorted((a, b) => a.entry.enqueuedAt - b.entry.enqueuedAt);
+
+    if (matchingEntries.length === 0) {
+      return;
+    }
+
+    opts.log.info(
+      `${opts.logLabel}: ${matchingEntries.length} pending message(s) matched ${opts.drainKey}`,
+    );
+
+    for (const { entry, decision } of matchingEntries) {
+      if (!claimRecoveryEntry(entry.id)) {
+        opts.log.info(`${opts.logLabel}: entry ${entry.id} is already being recovered`);
+        continue;
+      }
+
+      try {
+        if (entry.retryCount >= MAX_RETRIES) {
+          try {
+            await moveToFailed(entry.id, opts.stateDir);
+          } catch (err) {
+            if (getErrnoCode(err) === "ENOENT") {
+              opts.log.info(`${opts.logLabel}: entry ${entry.id} already gone, skipping`);
+              continue;
+            }
+            throw err;
+          }
+          opts.log.warn(
+            `${opts.logLabel}: entry ${entry.id} exceeded max retries and was moved to failed/`,
+          );
+          continue;
+        }
+
+        if (!decision.bypassBackoff) {
+          const retryEligibility = isEntryEligibleForRecoveryRetry(entry, Date.now());
+          if (!retryEligibility.eligible) {
+            opts.log.info(
+              `${opts.logLabel}: entry ${entry.id} not ready for retry yet — backoff ${retryEligibility.remainingBackoffMs}ms remaining`,
+            );
+            continue;
+          }
+        }
+
+        const result = await drainQueuedEntry({
+          entry,
+          cfg: opts.cfg,
+          deliver,
+          stateDir: opts.stateDir,
+          onFailed: (_, errMsg) => {
+            if (isPermanentDeliveryError(errMsg)) {
+              opts.log.warn(
+                `${opts.logLabel}: entry ${entry.id} hit permanent error — moving to failed/: ${errMsg}`,
+              );
+              return;
+            }
+            opts.log.warn(`${opts.logLabel}: retry failed for entry ${entry.id}: ${errMsg}`);
+          },
+        });
+        if (result === "recovered") {
+          opts.log.info(
+            `${opts.logLabel}: drained delivery ${entry.id} to ${entry.channel}:${entry.to}`,
+          );
+        }
+      } finally {
+        releaseRecoveryEntry(entry.id);
+      }
+    }
+  } finally {
+    drainInProgress.delete(opts.drainKey);
+  }
+}
+
 export async function drainReconnectQueue(opts: {
   accountId: string;
   cfg: OpenClawConfig;
@@ -186,76 +330,23 @@ export async function drainReconnectQueue(opts: {
   stateDir?: string;
   deliver?: DeliverFn;
 }): Promise<void> {
-  if (drainInProgress.get(opts.accountId)) {
-    opts.log.info(
-      `WhatsApp reconnect drain: already in progress for account ${opts.accountId}, skipping`,
-    );
-    return;
-  }
-
-  drainInProgress.set(opts.accountId, true);
-  try {
-    const matchingEntries = (await loadPendingDeliveries(opts.stateDir))
-      .filter(
-        (entry) =>
-          entry.channel === "whatsapp" &&
-          normalizeQueueAccountId(entry.accountId) === opts.accountId &&
-          typeof entry.lastError === "string" &&
-          NO_LISTENER_ERROR_RE.test(entry.lastError),
-      )
-      .toSorted((a, b) => a.enqueuedAt - b.enqueuedAt);
-
-    if (matchingEntries.length === 0) {
-      return;
-    }
-
-    opts.log.info(
-      `WhatsApp reconnect drain: ${matchingEntries.length} pending message(s) for account ${opts.accountId}`,
-    );
-
-    const deliver = opts.deliver ?? (await loadDeliverRuntime()).deliverOutboundPayloads;
-
-    for (const entry of matchingEntries) {
-      if (!claimRecoveryEntry(entry.id)) {
-        opts.log.info(`WhatsApp reconnect drain: entry ${entry.id} is already being recovered`);
-        continue;
-      }
-
-      if (entry.retryCount >= MAX_RETRIES) {
-        try {
-          await moveToFailed(entry.id, opts.stateDir);
-        } catch (err) {
-          if (getErrnoCode(err) === "ENOENT") {
-            opts.log.info(`reconnect drain: entry ${entry.id} already gone, skipping`);
-            continue;
-          }
-          throw err;
-        } finally {
-          releaseRecoveryEntry(entry.id);
-        }
-        opts.log.warn(
-          `WhatsApp reconnect drain: entry ${entry.id} exceeded max retries and was moved to failed/`,
-        );
-        continue;
-      }
-
-      try {
-        await deliver(buildRecoveryDeliverParams(entry, opts.cfg));
-        await ackDelivery(entry.id, opts.stateDir);
-      } catch (err) {
-        const errMsg = formatErrorMessage(err);
-        if (isPermanentDeliveryError(errMsg)) {
-          await moveToFailed(entry.id, opts.stateDir).catch(() => {});
-        } else {
-          await failDelivery(entry.id, errMsg, opts.stateDir).catch(() => {});
-        }
-      } finally {
-        releaseRecoveryEntry(entry.id);
-      }
-    }
-  } finally {
-    drainInProgress.delete(opts.accountId);
-  }
+  const normalizedAccountId = normalizeQueueAccountId(opts.accountId);
+  await drainPendingDeliveries({
+    drainKey: `whatsapp:${normalizedAccountId}`,
+    logLabel: "WhatsApp reconnect drain",
+    cfg: opts.cfg,
+    log: opts.log,
+    stateDir: opts.stateDir,
+    deliver: opts.deliver,
+    selectEntry: (entry) => ({
+      match:
+        entry.channel === "whatsapp" &&
+        normalizeQueueAccountId(entry.accountId) === normalizedAccountId &&
+        typeof entry.lastError === "string" &&
+        NO_LISTENER_ERROR_RE.test(entry.lastError),
+      bypassBackoff: true,
+    }),
+  });
 }
 
 /**
@@ -321,25 +412,29 @@ export async function recoverPendingDeliveries(opts: {
     }
 
     try {
-      await opts.deliver(buildRecoveryDeliverParams(entry, opts.cfg));
-      await ackDelivery(entry.id, opts.stateDir);
-      summary.recovered += 1;
-      opts.log.info(`Recovered delivery ${entry.id} to ${entry.channel}:${entry.to}`);
-    } catch (err) {
-      const errMsg = formatErrorMessage(err);
-      if (isPermanentDeliveryError(errMsg)) {
-        opts.log.warn(`Delivery ${entry.id} hit permanent error — moving to failed/: ${errMsg}`);
-        await moveEntryToFailedWithLogging(entry.id, opts.log, opts.stateDir);
-        summary.failed += 1;
+      const result = await drainQueuedEntry({
+        entry,
+        cfg: opts.cfg,
+        deliver: opts.deliver,
+        stateDir: opts.stateDir,
+        onRecovered: () => {
+          summary.recovered += 1;
+          opts.log.info(`Recovered delivery ${entry.id} to ${entry.channel}:${entry.to}`);
+        },
+        onFailed: (_, errMsg) => {
+          summary.failed += 1;
+          if (isPermanentDeliveryError(errMsg)) {
+            opts.log.warn(
+              `Delivery ${entry.id} hit permanent error — moving to failed/: ${errMsg}`,
+            );
+            return;
+          }
+          opts.log.warn(`Retry failed for delivery ${entry.id}: ${errMsg}`);
+        },
+      });
+      if (result === "moved-to-failed") {
         continue;
       }
-      try {
-        await failDelivery(entry.id, errMsg, opts.stateDir);
-      } catch {
-        // Best-effort update.
-      }
-      summary.failed += 1;
-      opts.log.warn(`Retry failed for delivery ${entry.id}: ${errMsg}`);
     } finally {
       releaseRecoveryEntry(entry.id);
     }

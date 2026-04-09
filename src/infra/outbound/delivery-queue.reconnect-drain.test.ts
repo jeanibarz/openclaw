@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import type { OpenClawConfig } from "../../config/config.js";
 import {
   type DeliverFn,
+  drainPendingDeliveries,
   drainReconnectQueue,
   enqueueDelivery,
   failDelivery,
@@ -22,6 +23,28 @@ function createMockLogger(): RecoveryLogger {
 }
 
 const stubCfg = {} as OpenClawConfig;
+const NO_LISTENER_ERROR = "No active WhatsApp Web listener";
+
+async function drainWhatsAppReconnectPending(opts: {
+  accountId: string;
+  deliver: DeliverFn;
+  log: RecoveryLogger;
+  stateDir: string;
+}) {
+  await drainPendingDeliveries({
+    drainKey: `whatsapp:${opts.accountId}`,
+    logLabel: "WhatsApp reconnect drain",
+    cfg: stubCfg,
+    log: opts.log,
+    stateDir: opts.stateDir,
+    deliver: opts.deliver,
+    selectEntry: (entry) => ({
+      match: entry.channel === "whatsapp" && (entry.accountId ?? "default") === opts.accountId,
+      bypassBackoff:
+        typeof entry.lastError === "string" && entry.lastError.includes(NO_LISTENER_ERROR),
+    }),
+  });
+}
 
 describe("drainReconnectQueue", () => {
   let fixtureRoot = "";
@@ -278,5 +301,136 @@ describe("drainReconnectQueue", () => {
 
     resolveDeliver!();
     await startupRecovery;
+  });
+});
+
+describe("drainPendingDeliveries for WhatsApp reconnect", () => {
+  let fixtureRoot = "";
+  let tmpDir: string;
+  let fixtureCount = 0;
+
+  beforeAll(() => {
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-drain-pending-"));
+  });
+
+  beforeEach(() => {
+    tmpDir = path.join(fixtureRoot, `case-${fixtureCount++}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+  });
+
+  afterAll(() => {
+    if (!fixtureRoot) {
+      return;
+    }
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    fixtureRoot = "";
+  });
+
+  it("drains fresh pending WhatsApp entries for the reconnecting account", async () => {
+    const log = createMockLogger();
+    const deliver = vi.fn<DeliverFn>(async () => {});
+
+    await enqueueDelivery(
+      { channel: "whatsapp", to: "+1555", payloads: [{ text: "hi" }], accountId: "acct1" },
+      tmpDir,
+    );
+
+    await drainWhatsAppReconnectPending({
+      accountId: "acct1",
+      deliver,
+      log,
+      stateDir: tmpDir,
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(
+      fs.readdirSync(path.join(tmpDir, "delivery-queue")).filter((f) => f.endsWith(".json")),
+    ).toEqual([]);
+  });
+
+  it("drains backoff-eligible WhatsApp retries on reconnect", async () => {
+    const log = createMockLogger();
+    const deliver = vi.fn<DeliverFn>(async () => {});
+
+    const id = await enqueueDelivery(
+      { channel: "whatsapp", to: "+1555", payloads: [{ text: "hi" }], accountId: "acct1" },
+      tmpDir,
+    );
+    await failDelivery(id, "network down", tmpDir);
+    const entryPath = path.join(tmpDir, "delivery-queue", `${id}.json`);
+    const entry = JSON.parse(fs.readFileSync(entryPath, "utf-8")) as {
+      lastAttemptAt?: number;
+    };
+    entry.lastAttemptAt = Date.now() - 30_000;
+    fs.writeFileSync(entryPath, JSON.stringify(entry, null, 2));
+
+    await drainWhatsAppReconnectPending({
+      accountId: "acct1",
+      deliver,
+      log,
+      stateDir: tmpDir,
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not bypass backoff for ordinary transient errors on reconnect", async () => {
+    const log = createMockLogger();
+    const deliver = vi.fn<DeliverFn>(async () => {});
+
+    const id = await enqueueDelivery(
+      { channel: "whatsapp", to: "+1555", payloads: [{ text: "hi" }], accountId: "acct1" },
+      tmpDir,
+    );
+    await failDelivery(id, "network down", tmpDir);
+
+    await drainWhatsAppReconnectPending({
+      accountId: "acct1",
+      deliver,
+      log,
+      stateDir: tmpDir,
+    });
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("not ready for retry yet"));
+  });
+
+  it("still bypasses backoff for no-listener failures on reconnect", async () => {
+    const log = createMockLogger();
+    const deliver = vi.fn<DeliverFn>(async () => {});
+
+    const id = await enqueueDelivery(
+      { channel: "whatsapp", to: "+1555", payloads: [{ text: "hi" }], accountId: "acct1" },
+      tmpDir,
+    );
+    await failDelivery(id, NO_LISTENER_ERROR, tmpDir);
+
+    await drainWhatsAppReconnectPending({
+      accountId: "acct1",
+      deliver,
+      log,
+      stateDir: tmpDir,
+    });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores non-WhatsApp entries even when reconnect drain runs", async () => {
+    const log = createMockLogger();
+    const deliver = vi.fn<DeliverFn>(async () => {});
+
+    await enqueueDelivery(
+      { channel: "telegram", to: "+1555", payloads: [{ text: "hi" }], accountId: "acct1" },
+      tmpDir,
+    );
+
+    await drainWhatsAppReconnectPending({
+      accountId: "acct1",
+      deliver,
+      log,
+      stateDir: tmpDir,
+    });
+
+    expect(deliver).not.toHaveBeenCalled();
   });
 });

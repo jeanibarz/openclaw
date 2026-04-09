@@ -59,8 +59,6 @@ const PERMANENT_ERROR_PATTERNS: readonly RegExp[] = [
   /User .* not in room/i,
 ];
 
-const NO_LISTENER_ERROR_RE = /No active WhatsApp Web listener/i;
-
 const drainInProgress = new Map<string, boolean>();
 const entriesInProgress = new Set<string>();
 
@@ -71,10 +69,6 @@ let deliverRuntimePromise: Promise<DeliverRuntimeModule> | null = null;
 function loadDeliverRuntime() {
   deliverRuntimePromise ??= import("./deliver-runtime.js");
   return deliverRuntimePromise;
-}
-
-function normalizeQueueAccountId(accountId?: string): string {
-  return (accountId ?? "").trim() || "default";
 }
 
 function getErrnoCode(err: unknown): string | null {
@@ -321,32 +315,6 @@ export async function drainPendingDeliveries(opts: {
   } finally {
     drainInProgress.delete(opts.drainKey);
   }
-}
-
-export async function drainReconnectQueue(opts: {
-  accountId: string;
-  cfg: OpenClawConfig;
-  log: RecoveryLogger;
-  stateDir?: string;
-  deliver?: DeliverFn;
-}): Promise<void> {
-  const normalizedAccountId = normalizeQueueAccountId(opts.accountId);
-  await drainPendingDeliveries({
-    drainKey: `whatsapp:${normalizedAccountId}`,
-    logLabel: "WhatsApp reconnect drain",
-    cfg: opts.cfg,
-    log: opts.log,
-    stateDir: opts.stateDir,
-    deliver: opts.deliver,
-    selectEntry: (entry) => ({
-      match:
-        entry.channel === "whatsapp" &&
-        normalizeQueueAccountId(entry.accountId) === normalizedAccountId &&
-        typeof entry.lastError === "string" &&
-        NO_LISTENER_ERROR_RE.test(entry.lastError),
-      bypassBackoff: true,
-    }),
-  });
 }
 
 /**

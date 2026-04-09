@@ -10,7 +10,6 @@ export type { QueuedDelivery, QueuedDeliveryPayload } from "./delivery-queue-sto
 export {
   computeBackoffMs,
   drainPendingDeliveries,
-  drainReconnectQueue,
   isEntryEligibleForRecoveryRetry,
   isPermanentDeliveryError,
   MAX_RETRIES,

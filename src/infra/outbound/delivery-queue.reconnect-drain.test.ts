@@ -6,7 +6,6 @@ import type { OpenClawConfig } from "../../config/config.js";
 import {
   type DeliverFn,
   drainPendingDeliveries,
-  drainReconnectQueue,
   enqueueDelivery,
   failDelivery,
   MAX_RETRIES,
@@ -46,7 +45,7 @@ async function drainWhatsAppReconnectPending(opts: {
   });
 }
 
-describe("drainReconnectQueue", () => {
+describe("drainPendingDeliveries for WhatsApp reconnect", () => {
   let fixtureRoot = "";
   let tmpDir: string;
   let fixtureCount = 0;
@@ -78,12 +77,11 @@ describe("drainReconnectQueue", () => {
     );
     await failDelivery(id, "No active WhatsApp Web listener", tmpDir);
 
-    await drainReconnectQueue({
+    await drainWhatsAppReconnectPending({
       accountId: "acct1",
-      cfg: stubCfg,
+      deliver,
       log,
       stateDir: tmpDir,
-      deliver,
     });
 
     expect(deliver).toHaveBeenCalledTimes(1);
@@ -102,12 +100,11 @@ describe("drainReconnectQueue", () => {
     );
     await failDelivery(id, "No active WhatsApp Web listener", tmpDir);
 
-    await drainReconnectQueue({
+    await drainWhatsAppReconnectPending({
       accountId: "acct1",
-      cfg: stubCfg,
+      deliver,
       log,
       stateDir: tmpDir,
-      deliver,
     });
 
     // deliver should not be called since no eligible entries for acct1
@@ -133,12 +130,11 @@ describe("drainReconnectQueue", () => {
       lastError?: string;
     };
 
-    await drainReconnectQueue({
+    await drainWhatsAppReconnectPending({
       accountId: "acct1",
-      cfg: stubCfg,
+      deliver,
       log,
       stateDir: tmpDir,
-      deliver,
     });
 
     expect(deliver).toHaveBeenCalledTimes(1);
@@ -168,12 +164,11 @@ describe("drainReconnectQueue", () => {
 
     // Should not throw
     await expect(
-      drainReconnectQueue({
+      drainWhatsAppReconnectPending({
         accountId: "acct1",
-        cfg: stubCfg,
+        deliver,
         log,
         stateDir: tmpDir,
-        deliver,
       }),
     ).resolves.toBeUndefined();
   });
@@ -192,12 +187,11 @@ describe("drainReconnectQueue", () => {
       await failDelivery(id, "No active WhatsApp Web listener", tmpDir);
     }
 
-    await drainReconnectQueue({
+    await drainWhatsAppReconnectPending({
       accountId: "acct1",
-      cfg: stubCfg,
+      deliver,
       log,
       stateDir: tmpDir,
-      deliver,
     });
 
     // Should have moved to failed, not delivered
@@ -231,12 +225,12 @@ describe("drainReconnectQueue", () => {
     entry.retryCount = 1;
     fs.writeFileSync(entryPath, JSON.stringify(entry, null, 2));
 
-    const opts = { accountId: "acct1", cfg: stubCfg, log, stateDir: tmpDir, deliver };
+    const opts = { accountId: "acct1", log, stateDir: tmpDir, deliver };
 
     // Start first drain (will block on deliver)
-    const first = drainReconnectQueue(opts);
+    const first = drainWhatsAppReconnectPending(opts);
     // Start second drain immediately — should be skipped
-    const second = drainReconnectQueue(opts);
+    const second = drainWhatsAppReconnectPending(opts);
     await second;
 
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining("already in progress"));
@@ -286,12 +280,11 @@ describe("drainReconnectQueue", () => {
       expect(deliver).toHaveBeenCalledTimes(1);
     });
 
-    await drainReconnectQueue({
+    await drainWhatsAppReconnectPending({
       accountId: "acct1",
-      cfg: stubCfg,
+      deliver,
       log,
       stateDir: tmpDir,
-      deliver,
     });
 
     expect(deliver).toHaveBeenCalledTimes(1);
@@ -302,30 +295,6 @@ describe("drainReconnectQueue", () => {
     resolveDeliver!();
     await startupRecovery;
   });
-});
-
-describe("drainPendingDeliveries for WhatsApp reconnect", () => {
-  let fixtureRoot = "";
-  let tmpDir: string;
-  let fixtureCount = 0;
-
-  beforeAll(() => {
-    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-drain-pending-"));
-  });
-
-  beforeEach(() => {
-    tmpDir = path.join(fixtureRoot, `case-${fixtureCount++}`);
-    fs.mkdirSync(tmpDir, { recursive: true });
-  });
-
-  afterAll(() => {
-    if (!fixtureRoot) {
-      return;
-    }
-    fs.rmSync(fixtureRoot, { recursive: true, force: true });
-    fixtureRoot = "";
-  });
-
   it("drains fresh pending WhatsApp entries for the reconnecting account", async () => {
     const log = createMockLogger();
     const deliver = vi.fn<DeliverFn>(async () => {});

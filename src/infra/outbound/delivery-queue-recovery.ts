@@ -3,6 +3,7 @@ import { formatErrorMessage } from "../errors.js";
 import {
   ackDelivery,
   failDelivery,
+  loadPendingDelivery,
   loadPendingDeliveries,
   moveToFailed,
   type QueuedDelivery,
@@ -262,50 +263,59 @@ export async function drainPendingDeliveries(opts: {
       }
 
       try {
-        if (entry.retryCount >= MAX_RETRIES) {
+        // Re-read after claim so the queue file remains the source of truth.
+        // This prevents stale startup/reconnect snapshots from re-sending an
+        // entry that another recovery path already acked.
+        const currentEntry = await loadPendingDelivery(entry.id, opts.stateDir);
+        if (!currentEntry) {
+          opts.log.info(`${opts.logLabel}: entry ${entry.id} already gone, skipping`);
+          continue;
+        }
+
+        if (currentEntry.retryCount >= MAX_RETRIES) {
           try {
-            await moveToFailed(entry.id, opts.stateDir);
+            await moveToFailed(currentEntry.id, opts.stateDir);
           } catch (err) {
             if (getErrnoCode(err) === "ENOENT") {
-              opts.log.info(`${opts.logLabel}: entry ${entry.id} already gone, skipping`);
+              opts.log.info(`${opts.logLabel}: entry ${currentEntry.id} already gone, skipping`);
               continue;
             }
             throw err;
           }
           opts.log.warn(
-            `${opts.logLabel}: entry ${entry.id} exceeded max retries and was moved to failed/`,
+            `${opts.logLabel}: entry ${currentEntry.id} exceeded max retries and was moved to failed/`,
           );
           continue;
         }
 
         if (!decision.bypassBackoff) {
-          const retryEligibility = isEntryEligibleForRecoveryRetry(entry, Date.now());
+          const retryEligibility = isEntryEligibleForRecoveryRetry(currentEntry, Date.now());
           if (!retryEligibility.eligible) {
             opts.log.info(
-              `${opts.logLabel}: entry ${entry.id} not ready for retry yet — backoff ${retryEligibility.remainingBackoffMs}ms remaining`,
+              `${opts.logLabel}: entry ${currentEntry.id} not ready for retry yet — backoff ${retryEligibility.remainingBackoffMs}ms remaining`,
             );
             continue;
           }
         }
 
         const result = await drainQueuedEntry({
-          entry,
+          entry: currentEntry,
           cfg: opts.cfg,
           deliver,
           stateDir: opts.stateDir,
-          onFailed: (_, errMsg) => {
+          onFailed: (failedEntry, errMsg) => {
             if (isPermanentDeliveryError(errMsg)) {
               opts.log.warn(
-                `${opts.logLabel}: entry ${entry.id} hit permanent error — moving to failed/: ${errMsg}`,
+                `${opts.logLabel}: entry ${failedEntry.id} hit permanent error — moving to failed/: ${errMsg}`,
               );
               return;
             }
-            opts.log.warn(`${opts.logLabel}: retry failed for entry ${entry.id}: ${errMsg}`);
+            opts.log.warn(`${opts.logLabel}: retry failed for entry ${failedEntry.id}: ${errMsg}`);
           },
         });
         if (result === "recovered") {
           opts.log.info(
-            `${opts.logLabel}: drained delivery ${entry.id} to ${entry.channel}:${entry.to}`,
+            `${opts.logLabel}: drained delivery ${currentEntry.id} on ${currentEntry.channel}`,
           );
         }
       } finally {
@@ -348,31 +358,6 @@ export async function recoverPendingDeliveries(opts: {
       await deferRemainingEntriesForBudget(pending.slice(i), opts.stateDir);
       break;
     }
-    if (entry.retryCount >= MAX_RETRIES) {
-      if (!claimRecoveryEntry(entry.id)) {
-        opts.log.info(`Recovery skipped for delivery ${entry.id}: already being processed`);
-        continue;
-      }
-      try {
-        opts.log.warn(
-          `Delivery ${entry.id} exceeded max retries (${entry.retryCount}/${MAX_RETRIES}) — moving to failed/`,
-        );
-        await moveEntryToFailedWithLogging(entry.id, opts.log, opts.stateDir);
-        summary.skippedMaxRetries += 1;
-      } finally {
-        releaseRecoveryEntry(entry.id);
-      }
-      continue;
-    }
-
-    const retryEligibility = isEntryEligibleForRecoveryRetry(entry, now);
-    if (!retryEligibility.eligible) {
-      summary.deferredBackoff += 1;
-      opts.log.info(
-        `Delivery ${entry.id} not ready for retry yet — backoff ${retryEligibility.remainingBackoffMs}ms remaining`,
-      );
-      continue;
-    }
 
     if (!claimRecoveryEntry(entry.id)) {
       opts.log.info(`Recovery skipped for delivery ${entry.id}: already being processed`);
@@ -380,24 +365,48 @@ export async function recoverPendingDeliveries(opts: {
     }
 
     try {
+      const currentEntry = await loadPendingDelivery(entry.id, opts.stateDir);
+      if (!currentEntry) {
+        opts.log.info(`Recovery skipped for delivery ${entry.id}: already gone`);
+        continue;
+      }
+
+      if (currentEntry.retryCount >= MAX_RETRIES) {
+        opts.log.warn(
+          `Delivery ${currentEntry.id} exceeded max retries (${currentEntry.retryCount}/${MAX_RETRIES}) — moving to failed/`,
+        );
+        await moveEntryToFailedWithLogging(currentEntry.id, opts.log, opts.stateDir);
+        summary.skippedMaxRetries += 1;
+        continue;
+      }
+
+      const currentRetryEligibility = isEntryEligibleForRecoveryRetry(currentEntry, Date.now());
+      if (!currentRetryEligibility.eligible) {
+        summary.deferredBackoff += 1;
+        opts.log.info(
+          `Delivery ${currentEntry.id} not ready for retry yet — backoff ${currentRetryEligibility.remainingBackoffMs}ms remaining`,
+        );
+        continue;
+      }
+
       const result = await drainQueuedEntry({
-        entry,
+        entry: currentEntry,
         cfg: opts.cfg,
         deliver: opts.deliver,
         stateDir: opts.stateDir,
-        onRecovered: () => {
+        onRecovered: (recoveredEntry) => {
           summary.recovered += 1;
-          opts.log.info(`Recovered delivery ${entry.id} to ${entry.channel}:${entry.to}`);
+          opts.log.info(`Recovered delivery ${recoveredEntry.id} on ${recoveredEntry.channel}`);
         },
-        onFailed: (_, errMsg) => {
+        onFailed: (failedEntry, errMsg) => {
           summary.failed += 1;
           if (isPermanentDeliveryError(errMsg)) {
             opts.log.warn(
-              `Delivery ${entry.id} hit permanent error — moving to failed/: ${errMsg}`,
+              `Delivery ${failedEntry.id} hit permanent error — moving to failed/: ${errMsg}`,
             );
             return;
           }
-          opts.log.warn(`Retry failed for delivery ${entry.id}: ${errMsg}`);
+          opts.log.warn(`Retry failed for delivery ${failedEntry.id}: ${errMsg}`);
         },
       });
       if (result === "moved-to-failed") {

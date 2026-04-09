@@ -24,21 +24,28 @@ function createMockLogger(): RecoveryLogger {
 const stubCfg = {} as OpenClawConfig;
 const NO_LISTENER_ERROR = "No active WhatsApp Web listener";
 
+function normalizeReconnectAccountIdForTest(accountId?: string | null): string {
+  return (accountId ?? "").trim() || "default";
+}
+
 async function drainWhatsAppReconnectPending(opts: {
   accountId: string;
   deliver: DeliverFn;
   log: RecoveryLogger;
   stateDir: string;
 }) {
+  const normalizedAccountId = normalizeReconnectAccountIdForTest(opts.accountId);
   await drainPendingDeliveries({
-    drainKey: `whatsapp:${opts.accountId}`,
+    drainKey: `whatsapp:${normalizedAccountId}`,
     logLabel: "WhatsApp reconnect drain",
     cfg: stubCfg,
     log: opts.log,
     stateDir: opts.stateDir,
     deliver: opts.deliver,
     selectEntry: (entry) => ({
-      match: entry.channel === "whatsapp" && (entry.accountId ?? "default") === opts.accountId,
+      match:
+        entry.channel === "whatsapp" &&
+        normalizeReconnectAccountIdForTest(entry.accountId) === normalizedAccountId,
       bypassBackoff:
         typeof entry.lastError === "string" && entry.lastError.includes(NO_LISTENER_ERROR),
     }),
@@ -294,6 +301,60 @@ describe("drainPendingDeliveries for WhatsApp reconnect", () => {
 
     resolveDeliver!();
     await startupRecovery;
+  });
+
+  it("does not re-deliver a stale startup snapshot after reconnect already acked it", async () => {
+    const log = createMockLogger();
+    const startupLog = createMockLogger();
+    let releaseBlocker: () => void;
+    const blocker = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    const deliveredTargets: string[] = [];
+    const deliver = vi.fn<DeliverFn>(async ({ to }) => {
+      deliveredTargets.push(to);
+      if (to === "+1000") {
+        await blocker;
+      }
+    });
+
+    await enqueueDelivery(
+      { channel: "demo-channel-a", to: "+1000", payloads: [{ text: "blocker" }] },
+      tmpDir,
+    );
+    await enqueueDelivery(
+      { channel: "whatsapp", to: "+1555", payloads: [{ text: "hi" }], accountId: "acct1" },
+      tmpDir,
+    );
+
+    const startupRecovery = recoverPendingDeliveries({
+      cfg: stubCfg,
+      deliver,
+      log: startupLog,
+      stateDir: tmpDir,
+    });
+
+    await vi.waitFor(() => {
+      expect(deliver).toHaveBeenCalledWith(
+        expect.objectContaining({ channel: "demo-channel-a", to: "+1000" }),
+      );
+    });
+
+    await drainWhatsAppReconnectPending({
+      accountId: "acct1",
+      deliver,
+      log,
+      stateDir: tmpDir,
+    });
+
+    releaseBlocker!();
+    await startupRecovery;
+
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliveredTargets.filter((target) => target === "+1555")).toHaveLength(1);
+    expect(startupLog.info).toHaveBeenCalledWith(
+      expect.stringContaining("Recovery skipped for delivery"),
+    );
   });
   it("drains fresh pending WhatsApp entries for the reconnecting account", async () => {
     const log = createMockLogger();

@@ -3,6 +3,7 @@ export {
   enqueueDelivery,
   ensureQueueDir,
   failDelivery,
+  loadPendingDelivery,
   loadPendingDeliveries,
   moveToFailed,
 } from "./delivery-queue-storage.js";

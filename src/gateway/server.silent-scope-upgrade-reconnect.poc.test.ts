@@ -40,6 +40,11 @@ describe("gateway silent scope-upgrade reconnect", () => {
         (obj) => obj.type === "event" && obj.event === "device.pair.requested",
       );
       sharedAuthReconnectWs = await openTrackedWs(started.port);
+      const closeFrame = new Promise<{ code: number; reason: string }>((resolve) => {
+        sharedAuthReconnectWs?.once("close", (code, reason) => {
+          resolve({ code, reason: reason.toString() });
+        });
+      });
       const sharedAuthUpgradeAttempt = await connectReq(sharedAuthReconnectWs, {
         token: "secret",
         deviceIdentityPath: paired.identityPath,
@@ -47,6 +52,13 @@ describe("gateway silent scope-upgrade reconnect", () => {
       });
       expect(sharedAuthUpgradeAttempt.ok).toBe(false);
       expect(sharedAuthUpgradeAttempt.error?.message).toBe("pairing required (scope-upgrade)");
+      // Issue #64421: close-frame reason must also carry the specific pairing reason
+      // so CLI/TUI users see "pairing required (scope-upgrade)" instead of a generic
+      // "pairing required" when cron.add (or any admin-scope call) hits scope elevation.
+      await expect(closeFrame).resolves.toEqual({
+        code: 1008,
+        reason: "pairing required (scope-upgrade)",
+      });
 
       const pending = await devicePairingModule.listDevicePairing();
       expect(pending.pending).toHaveLength(1);

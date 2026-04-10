@@ -1004,7 +1004,7 @@ export function attachGatewayWsMessageHandler(params: {
                   },
                 }),
               });
-              close(1008, pairingRequiredMessage);
+              close(1008, truncateCloseReason(pairingRequiredMessage));
               return false;
             }
             return true;

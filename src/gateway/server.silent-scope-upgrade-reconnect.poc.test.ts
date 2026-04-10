@@ -46,7 +46,7 @@ describe("gateway silent scope-upgrade reconnect", () => {
         scopes: ["operator.admin"],
       });
       expect(sharedAuthUpgradeAttempt.ok).toBe(false);
-      expect(sharedAuthUpgradeAttempt.error?.message).toBe("pairing required");
+      expect(sharedAuthUpgradeAttempt.error?.message).toBe("pairing required (scope-upgrade)");
 
       const pending = await devicePairingModule.listDevicePairing();
       expect(pending.pending).toHaveLength(1);
@@ -118,7 +118,7 @@ describe("gateway silent scope-upgrade reconnect", () => {
         scopes: ["operator.admin"],
       });
       expect(reconnectAttempt.ok).toBe(false);
-      expect(reconnectAttempt.error?.message).toBe("pairing required");
+      expect(reconnectAttempt.error?.message).toBe("pairing required (scope-upgrade)");
 
       const pending = await devicePairingModule.listDevicePairing();
       expect(pending.pending).toHaveLength(1);
@@ -222,7 +222,7 @@ describe("gateway silent scope-upgrade reconnect", () => {
       });
 
       expect(res.ok).toBe(false);
-      expect(res.error?.message).toBe("pairing required");
+      expect(res.error?.message).toBe("pairing required (not-paired)");
       expect(
         (res.error?.details as { requestId?: unknown; code?: string } | undefined)?.requestId,
       ).toBeUndefined();
@@ -275,7 +275,7 @@ describe("gateway silent scope-upgrade reconnect", () => {
       });
 
       expect(res.ok).toBe(false);
-      expect(res.error?.message).toBe("pairing required");
+      expect(res.error?.message).toBe("pairing required (not-paired)");
       expect(replacementRequestId).toBeTruthy();
       expect(
         (res.error?.details as { requestId?: unknown; code?: string } | undefined)?.requestId,

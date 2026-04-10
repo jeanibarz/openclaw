@@ -991,11 +991,12 @@ export function attachGatewayWsMessageHandler(params: {
                 ...(recoveryRequestId ? { requestId: recoveryRequestId } : {}),
                 reason,
               });
+              const pairingRequiredMessage = `pairing required (${reason})`;
               send({
                 type: "res",
                 id: frame.id,
                 ok: false,
-                error: errorShape(ErrorCodes.NOT_PAIRED, "pairing required", {
+                error: errorShape(ErrorCodes.NOT_PAIRED, pairingRequiredMessage, {
                   details: {
                     code: ConnectErrorDetailCodes.PAIRING_REQUIRED,
                     ...(recoveryRequestId ? { requestId: recoveryRequestId } : {}),
@@ -1003,7 +1004,7 @@ export function attachGatewayWsMessageHandler(params: {
                   },
                 }),
               });
-              close(1008, "pairing required");
+              close(1008, pairingRequiredMessage);
               return false;
             }
             return true;
